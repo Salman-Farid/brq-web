@@ -258,33 +258,133 @@ export function warpToDocument(
 /* ------------------------------------------------------------------ */
 
 /**
- * Gentle scan clean-up — lift the dark cast, keep colors natural.
- * Shadows brighten more than highlights (clear, not “burned”).
+ * CamScanner-style document clean-up (balanced — paper stays natural white-ish):
+ *  - suppress low-frequency shadows / uneven light
+ *  - neutralize yellow-gray camera cast (mild)
+ *  - paper a little cleaner, not pure white
+ *  - text darker and more defined (contrast + unsharp)
+ *  - paper slightly desaturated; colored stamps / highlights keep their color
  */
 export function magicColorEnhance(canvas: HTMLCanvasElement): HTMLCanvasElement {
   const ctx = canvas.getContext('2d', { willReadFrequently: true })
   if (!ctx) return canvas
   const w = canvas.width
   const h = canvas.height
-  if (w < 8 || h < 8) return canvas
+  if (w < 16 || h < 16) return canvas
 
   const img = ctx.getImageData(0, 0, w, h)
   const d = img.data
+  const n = w * h
 
-  // Soft shadow lift (gamma) — clear the dark vibe without crushing colors
-  const lut = new Uint8ClampedArray(256)
-  for (let i = 0; i < 256; i++) {
-    const x = i / 255
-    // pow < 1 brightens; blend keeps highlights safe
-    const lifted = Math.pow(x, 0.72)
-    lut[i] = clamp(Math.round((x * 0.25 + lifted * 0.75) * 255), 0, 255)
+  const yPlane = new Float32Array(n)
+  const uPlane = new Float32Array(n)
+  const vPlane = new Float32Array(n)
+
+  // --- 1. Mild white-balance: neutralize yellow/gray cast from paper estimate ---
+  let sr = 0, sg = 0, sb = 0, sc = 0
+  for (let i = 0; i < n; i++) {
+    const p = i * 4
+    const y = d[p] * 0.299 + d[p + 1] * 0.587 + d[p + 2] * 0.114
+    if (y > 150) {
+      sr += d[p]; sg += d[p + 1]; sb += d[p + 2]; sc++
+    }
   }
-  for (let i = 0; i < d.length; i += 4) {
-    d[i] = lut[d[i]]
-    d[i + 1] = lut[d[i + 1]]
-    d[i + 2] = lut[d[i + 2]]
+  let gR = 1, gG = 1, gB = 1
+  if (sc > n * 0.015) {
+    const wr = sr / sc, wg = sg / sc, wb = sb / sc
+    // Soft correction toward neutral — only a fraction of the gap
+    const target = (wr + wg + wb) / 3
+    const mix = 0.45
+    gR = clamp(1 + (target / Math.max(40, wr) - 1) * mix, 0.88, 1.12)
+    gG = clamp(1 + (target / Math.max(40, wg) - 1) * mix, 0.88, 1.12)
+    gB = clamp(1 + (target / Math.max(40, wb) - 1) * mix, 0.88, 1.12)
+  }
+
+  for (let i = 0; i < n; i++) {
+    const p = i * 4
+    const r = clamp(d[p] * gR, 0, 255)
+    const g = clamp(d[p + 1] * gG, 0, 255)
+    const b = clamp(d[p + 2] * gB, 0, 255)
+    const y = 0.299 * r + 0.587 * g + 0.114 * b
+    yPlane[i] = y
+    uPlane[i] = b - y
+    vPlane[i] = r - y
+  }
+
+  // --- 2. Suppress low-frequency shadows (illumination flatten, gentle) ---
+  const bigR = Math.max(8, Math.round(Math.min(w, h) / 12))
+  const illum = boxBlurFloat(yPlane, w, h, bigR)
+  for (let i = 0; i < n; i++) {
+    const ref = Math.max(40, illum[i])
+    // Flatten toward local mean without killing contrast
+    const flat = yPlane[i] * (160 / ref)
+    yPlane[i] = clamp(yPlane[i] * 0.45 + flat * 0.55, 0, 255)
+  }
+
+  // --- 3. Moderate contrast: darken text, lift paper a little (not pure white) ---
+  for (let i = 0; i < n; i++) {
+    const x = yPlane[i] / 255
+    // S-curve with a slightly deeper toe (text darker)
+    const s = x * x * (3 - 2 * x)
+    const curved = x * 0.65 + s * 0.35
+    // Keep paper from hitting 255 hard — soft highlight roll-off
+    const y = curved * 255
+    yPlane[i] = clamp(y < 128 ? y * 0.94 : 128 + (y - 128) * 1.06, 0, 255)
+  }
+
+  // --- 4. Unsharp for character clarity ---
+  const r1 = Math.max(1, Math.round(Math.min(w, h) / 380))
+  const blur1 = boxBlurFloat(yPlane, w, h, r1)
+  for (let i = 0; i < n; i++) {
+    yPlane[i] = clamp(yPlane[i] + 0.55 * (yPlane[i] - blur1[i]), 0, 255)
+  }
+  const blur2 = boxBlurFloat(yPlane, w, h, 1)
+  for (let i = 0; i < n; i++) {
+    yPlane[i] = clamp(yPlane[i] + 0.35 * (yPlane[i] - blur2[i]), 0, 255)
+  }
+
+  // --- 5. Recombine; slight desaturation only where already low-sat (paper) ---
+  for (let i = 0; i < n; i++) {
+    const y = yPlane[i]
+    let u = uPlane[i]
+    let v = vPlane[i]
+    const p = i * 4
+    const mx = Math.max(d[p], d[p + 1], d[p + 2])
+    const mn = Math.min(d[p], d[p + 1], d[p + 2])
+    const sat = mx <= 0 ? 0 : (mx - mn) / mx
+    // Paper (low sat) → slight desat; stamps / photos (higher sat) → keep
+    const satScale = sat < 0.18 ? 0.85 : 1
+    u *= satScale
+    v *= satScale
+    d[p] = clamp(y + v, 0, 255)
+    d[p + 1] = clamp(y - 0.509 * v - 0.194 * u, 0, 255)
+    d[p + 2] = clamp(y + u, 0, 255)
+    d[p + 3] = 255
   }
 
   ctx.putImageData(img, 0, 0)
   return canvas
+}
+
+function boxBlurFloat(src: Float32Array, w: number, h: number, r: number): Float32Array {
+  const tmp = new Float32Array(w * h)
+  const out = new Float32Array(w * h)
+  const k = 1 / (r * 2 + 1)
+  for (let y = 0; y < h; y++) {
+    let acc = 0
+    for (let x = -r; x <= r; x++) acc += src[y * w + Math.min(w - 1, Math.max(0, x))]
+    for (let x = 0; x < w; x++) {
+      tmp[y * w + x] = acc * k
+      acc += src[y * w + Math.min(w - 1, x + r + 1)] - src[y * w + Math.max(0, x - r)]
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let acc = 0
+    for (let y = -r; y <= r; y++) acc += tmp[Math.min(h - 1, Math.max(0, y)) * w + x]
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = acc * k
+      acc += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x]
+    }
+  }
+  return out
 }

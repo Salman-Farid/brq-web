@@ -269,7 +269,9 @@ function isCleanDocumentCrop(canvas: HTMLCanvasElement): boolean {
       const mx = Math.max(r, g, b)
       const mn = Math.min(r, g, b)
       const sat = mx <= 0 ? 0 : (mx - mn) / mx
-      const isPaper = mx > 215 && sat < 0.18
+      // Paper / card / sleeve — match detectWhiteDocument thresholds
+      // (cards under plastic are often ~180–210, not pure 250 white)
+      const isPaper = (mx > 165 && sat < 0.2) || (mx > 200 && sat < 0.35)
       const isColorful = sat > 0.4 && mx > 70 && mx < 230
       if (isPaper) paper++
       if (isColorful) colorful++
